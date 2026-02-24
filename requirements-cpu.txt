@@ -1,0 +1,5 @@
+# requirements-cpu.txt
+-r requirements-common.txt
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
