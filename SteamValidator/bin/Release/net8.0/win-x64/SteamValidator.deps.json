@@ -1,0 +1,79 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v8.0/win-x64",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {},
+    ".NETCoreApp,Version=v8.0/win-x64": {
+      "SteamValidator/1.0.0": {
+        "dependencies": {
+          "SteamKit2": "2.4.1",
+          "protobuf-net": "3.2.26"
+        },
+        "runtime": {
+          "SteamValidator.dll": {}
+        }
+      },
+      "protobuf-net/3.2.26": {
+        "dependencies": {
+          "protobuf-net.Core": "3.2.26"
+        },
+        "runtime": {
+          "lib/net6.0/protobuf-net.dll": {
+            "assemblyVersion": "3.0.0.0",
+            "fileVersion": "3.2.26.38424"
+          }
+        }
+      },
+      "protobuf-net.Core/3.2.26": {
+        "runtime": {
+          "lib/net6.0/protobuf-net.Core.dll": {
+            "assemblyVersion": "3.0.0.0",
+            "fileVersion": "3.2.26.38424"
+          }
+        }
+      },
+      "SteamKit2/2.4.1": {
+        "dependencies": {
+          "protobuf-net": "3.2.26"
+        },
+        "runtime": {
+          "lib/net6.0/SteamKit2.dll": {
+            "assemblyVersion": "2.4.1.0",
+            "fileVersion": "2.4.1.10"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "SteamValidator/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "protobuf-net/3.2.26": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-zBzBiKs4yP+tzQOsRA5WbI/zayS6eFv8g0KIKNPI7/RUY1nk9Oe+STmtbUYkNUkO3T3SidEoZv+tF1nmgTSutQ==",
+      "path": "protobuf-net/3.2.26",
+      "hashPath": "protobuf-net.3.2.26.nupkg.sha512"
+    },
+    "protobuf-net.Core/3.2.26": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-s8oJW9dBVxix4p8uqMbeG++DIGjgzOFAKoP2i5wayeeFOKBqG+cCBO2S/CAC4MAFlb5m1Os2m/miLcqRCgqJ7Q==",
+      "path": "protobuf-net.core/3.2.26",
+      "hashPath": "protobuf-net.core.3.2.26.nupkg.sha512"
+    },
+    "SteamKit2/2.4.1": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-t9yptysn/2YY6KZaI123vOOnumS+ZCFcC6MhFEkTiQ04mdpZ/EWhk5RVY7jU36IQHyTQUXotmn7taKFCXMKp4g==",
+      "path": "steamkit2/2.4.1",
+      "hashPath": "steamkit2.2.4.1.nupkg.sha512"
+    }
+  }
+}

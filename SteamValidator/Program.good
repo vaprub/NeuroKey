@@ -1,0 +1,637 @@
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
+using SteamKit2;
+using ProtoBuf;
+
+namespace SteamKeyValidator
+{
+    class Program
+    {
+        static async Task<int> Main(string[] args)
+        {
+            if (args.Length < 3)
+            {
+                Console.Error.WriteLine("Использование: SteamValidator.exe <логин> <пароль> <ключ> [2fa_code]");
+                return 1;
+            }
+
+            string username = args[0];
+            string password = args[1];
+            string key = args[2];
+            string? twoFactorCode = args.Length > 3 ? args[3] : null;
+
+            Console.WriteLine($"[INFO] Запуск валидации для пользователя {username}");
+            Console.WriteLine($"[INFO] Проверяемый ключ: {key}");
+
+            var validator = new SteamKeyValidator();
+            var timeoutCts = new CancellationTokenSource();
+            var timeoutTask = Task.Delay(180000, timeoutCts.Token);
+            var validationTask = validator.ValidateKey(username, password, key, twoFactorCode);
+            var completedTask = await Task.WhenAny(validationTask, timeoutTask);
+
+            if (completedTask == timeoutTask)
+            {
+                Console.WriteLine("[ERROR] Таймаут: Steam не отвечает в течение 180 секунд");
+                return 1;
+            }
+            else
+            {
+                timeoutCts.Cancel(); // отменяем таймаут, чтобы он не висел
+                Console.WriteLine("[TIMEOUT] Таймаут отменён.");
+            }
+
+            var result = await validationTask;
+
+            Console.WriteLine($"ИТОГОВЫЙ РЕЗУЛЬТАТ:");
+            Console.WriteLine($"RESULT:{result.Status}");
+            if (!string.IsNullOrEmpty(result.Message))
+                Console.WriteLine($"MESSAGE:{result.Message}");
+
+            // Логируем статистику ThreadPool перед завершением
+            ThreadPool.GetAvailableThreads(out int workerThreads, out int completionPortThreads);
+            ThreadPool.GetMaxThreads(out int maxWorkerThreads, out int maxCompletionPortThreads);
+            ThreadPool.GetMinThreads(out int minWorkerThreads, out int minCompletionPortThreads);
+            Console.WriteLine($"[THREADPOOL] Worker: доступно {workerThreads}/{maxWorkerThreads}, миним. {minWorkerThreads}; IOCP: доступно {completionPortThreads}/{maxCompletionPortThreads}, миним. {minCompletionPortThreads}");
+
+            // Принудительно завершаем процесс
+            Console.WriteLine("[EXIT] Принудительное завершение процесса.");
+            Environment.Exit(0);
+            return result.Status == "success" ? 0 : 1; // не выполнится
+        }
+    }
+
+    public class ValidationResult
+    {
+        public string Status { get; set; } = "pending";
+        public string Message { get; set; } = "";
+    }
+
+    [ProtoContract]
+    class CMsgClientRegisterKey : IExtensible
+    {
+        private IExtension? __pbn__extensionData;
+        IExtension IExtensible.GetExtensionObject(bool createIfMissing)
+            => Extensible.GetExtensionObject(ref __pbn__extensionData, createIfMissing);
+
+        [ProtoMember(1)]
+        public string key { get; set; } = "";
+    }
+
+    public class SteamKeyValidator
+    {
+        private SteamClient _steamClient = null!;
+        private CallbackManager _callbackManager = null!;
+        private SteamUser _steamUser = null!;
+        private byte[]? _sentryFile;
+        private string? _loginKey;
+        private string _username = null!;
+        private string _password = null!;
+        private string? _twoFactorCode;
+        private string? _authCode;
+        private string _keyToValidate = null!;
+        private ValidationResult _validationResult = null!;
+        private TaskCompletionSource<ValidationResult>? _tcs;
+        private bool _isRunning = true;
+        private bool _loginSuccess = false;
+        private int _codeAttempts = 0;
+        private const int MaxCodeAttempts = 3;
+        private const string SentryFile = "sentry.bin";
+        private const string LoginKeyFile = "loginkey.txt";
+
+        private void SaveLoginKey(string key)
+        {
+            try
+            {
+                File.WriteAllText(LoginKeyFile, key);
+                Console.WriteLine($"[LOGINKEY] Сохранён в {Path.GetFullPath(LoginKeyFile)} (длина: {key.Length})");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[LOGINKEY] Ошибка сохранения: {ex.Message}");
+            }
+        }
+
+        private string? LoadLoginKey()
+        {
+            try
+            {
+                if (File.Exists(LoginKeyFile))
+                {
+                    string key = File.ReadAllText(LoginKeyFile);
+                    Console.WriteLine($"[LOGINKEY] Загружен из {Path.GetFullPath(LoginKeyFile)} (длина: {key.Length})");
+                    return key;
+                }
+                else
+                {
+                    Console.WriteLine($"[LOGINKEY] Файл не найден: {Path.GetFullPath(LoginKeyFile)}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[LOGINKEY] Ошибка загрузки: {ex.Message}");
+            }
+            return null;
+        }
+
+        public async Task<ValidationResult> ValidateKey(string username, string password, string key, string? twoFactorCode = null)
+        {
+            _username = username;
+            _password = password;
+            _twoFactorCode = twoFactorCode;
+            _keyToValidate = key;
+            _validationResult = new ValidationResult();
+            _tcs = new TaskCompletionSource<ValidationResult>();
+
+            Console.WriteLine("[STEP 1] Создание конфигурации Steam...");
+            var config = SteamConfiguration.Create(b => b
+                .WithProtocolTypes(ProtocolTypes.Tcp | ProtocolTypes.WebSocket)
+            );
+
+            Console.WriteLine("[STEP 2] Создание клиента Steam...");
+            _steamClient = new SteamClient(config);
+            _callbackManager = new CallbackManager(_steamClient);
+            _steamUser = _steamClient.GetHandler<SteamUser>()!;
+
+            Console.WriteLine("[STEP 3] Подписка на события...");
+            _callbackManager.Subscribe<SteamClient.ConnectedCallback>(OnConnected);
+            _callbackManager.Subscribe<SteamClient.DisconnectedCallback>(OnDisconnected);
+            _callbackManager.Subscribe<SteamUser.LoggedOnCallback>(OnLoggedOn);
+            _callbackManager.Subscribe<SteamUser.LoggedOffCallback>(OnLoggedOff);
+            _callbackManager.Subscribe<SteamUser.LoginKeyCallback>(OnLoginKey);
+            _callbackManager.Subscribe<SteamUser.UpdateMachineAuthCallback>(OnMachineAuth);
+            _callbackManager.Subscribe<SteamApps.PurchaseResponseCallback>(OnPurchaseResult);
+
+            if (File.Exists(SentryFile))
+            {
+                var fi = new FileInfo(SentryFile);
+                Console.WriteLine($"[SENTRY] Найден файл: {Path.GetFullPath(SentryFile)} (размер: {fi.Length} байт)");
+                _sentryFile = File.ReadAllBytes(SentryFile);
+            }
+            else
+            {
+                Console.WriteLine($"[SENTRY] Файл не найден: {Path.GetFullPath(SentryFile)}");
+            }
+
+            // Загружаем сохранённый LoginKey
+            _loginKey = LoadLoginKey();
+
+            // ===== ДИАГНОСТИКА СЕТИ =====
+            Console.WriteLine("\n[DIAG] Диагностика сети:");
+            try
+            {
+                Console.Write("  DNS steamcommunity.com... ");
+                var hostEntry = Dns.GetHostEntry("steamcommunity.com");
+                Console.WriteLine($"OK, найдено IP: {hostEntry.AddressList.Length}");
+                foreach (var ip in hostEntry.AddressList)
+                {
+                    Console.WriteLine($"    - {ip}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"FAIL: {ex.Message}");
+            }
+
+            try
+            {
+                Console.Write("  TCP подключение к 208.64.200.52:27017... ");
+                using (var tcpClient = new TcpClient())
+                {
+                    var connectTask = tcpClient.ConnectAsync("208.64.200.52", 27017);
+                    if (await Task.WhenAny(connectTask, Task.Delay(5000)) == connectTask)
+                    {
+                        Console.WriteLine("OK");
+                        tcpClient.Close();
+                    }
+                    else
+                    {
+                        Console.WriteLine("таймаут");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"FAIL: {ex.Message}");
+            }
+            Console.WriteLine();
+
+            Console.WriteLine("[STEP 4] Запуск подключения...");
+            try
+            {
+                _steamClient.Connect();
+                Console.WriteLine("[CONNECT] Запрос на подключение отправлен");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERROR] Ошибка при подключении: {ex.Message}");
+                _validationResult.Status = "error";
+                _validationResult.Message = $"Ошибка подключения: {ex.Message}";
+                return _validationResult;
+            }
+
+            Console.WriteLine("[STEP 5] Ожидание ответа...");
+            
+            int loopCount = 0;
+            while (_isRunning)
+            {
+                _callbackManager.RunWaitCallbacks(TimeSpan.FromSeconds(1));
+                loopCount++;
+                if (loopCount % 10 == 0) // каждые 10 секунд
+                {
+                    Console.WriteLine($"[LOOP] Ожидание... _isRunning={_isRunning}, _loginSuccess={_loginSuccess}, статус результата={_validationResult.Status}");
+                }
+            }
+
+            Console.WriteLine("[DEBUG] Цикл завершён, возвращаем результат");
+            return await _tcs.Task;
+        }
+
+        private void OnConnected(SteamClient.ConnectedCallback callback)
+        {
+            Console.WriteLine("[ONCONNECTED] Подключено к Steam. Выполняю вход...");
+
+            byte[]? sentryHash = null;
+            if (_sentryFile != null)
+            {
+                sentryHash = CryptoHelper.SHAHash(_sentryFile);
+                Console.WriteLine($"[SENTRY] Использую сохранённый sentry файл, хеш: {Convert.ToBase64String(sentryHash)}");
+            }
+
+            try
+            {
+                // Приоритет: если есть LoginKey, используем его
+                if (!string.IsNullOrEmpty(_loginKey))
+                {
+                    Console.WriteLine($"[LOGIN] Пытаюсь войти с LoginKey (длина {_loginKey.Length})");
+                    _steamUser.LogOn(new SteamUser.LogOnDetails
+                    {
+                        Username = _username,
+                        LoginKey = _loginKey,
+                        ShouldRememberPassword = true
+                    });
+                }
+                else
+                {
+                    Console.WriteLine($"[LOGIN] Пытаюсь войти с паролем (authCode={_authCode ?? "null"}, 2FA={_twoFactorCode ?? "null"})");
+                    _steamUser.LogOn(new SteamUser.LogOnDetails
+                    {
+                        Username = _username,
+                        Password = _password,
+                        AuthCode = _authCode,
+                        TwoFactorCode = _twoFactorCode,
+                        SentryFileHash = sentryHash,
+                        ShouldRememberPassword = true
+                    });
+                }
+                Console.WriteLine("[LOGIN] Запрос отправлен");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERROR] Ошибка при отправке запроса на вход: {ex.Message}");
+                _validationResult.Status = "error";
+                _validationResult.Message = $"Ошибка входа: {ex.Message}";
+                _tcs?.TrySetResult(_validationResult);
+                _isRunning = false;
+            }
+        }
+
+        private void OnDisconnected(SteamClient.DisconnectedCallback callback)
+        {
+            Console.WriteLine($"[ONDISCONNECTED] Отключено. UserInitiated={callback.UserInitiated}");
+
+            // Если результат уже получен, завершаем
+            if (_validationResult.Status != "pending")
+            {
+                Console.WriteLine("[ONDISCONNECTED] Результат уже есть, завершаем цикл");
+                _isRunning = false;
+                return;
+            }
+
+            // Если мы уже успешно вошли, то просто ждём (не завершаем)
+            if (_loginSuccess)
+            {
+                Console.WriteLine("[ONDISCONNECTED] Успешный вход ранее, ожидаем ответа по ключу...");
+                return;
+            }
+
+            // Если мы ждём код или уже ввели его, то переподключаемся
+            if (_codeAttempts > 0 && !_loginSuccess)
+            {
+                Console.WriteLine("[RECONNECT] Ожидание 2 секунды перед переподключением...");
+                Thread.Sleep(2000);
+                _steamClient.Connect();
+                return;
+            }
+
+            // В остальных случаях ошибка
+            Console.WriteLine("[ONDISCONNECTED] Неожиданное отключение, завершаем с ошибкой");
+            _validationResult.Status = "error";
+            _validationResult.Message = "Отключено от Steam";
+            _tcs?.TrySetResult(_validationResult);
+            _isRunning = false;
+        }
+
+        private void OnLoggedOn(SteamUser.LoggedOnCallback callback)
+        {
+            Console.WriteLine($"[ONLOGGEDON] Результат: {callback.Result}");
+
+            if (callback.Result == EResult.AccountLogonDenied)
+            {
+                _codeAttempts++;
+                if (_codeAttempts > MaxCodeAttempts)
+                {
+                    Console.WriteLine("[2FA] Превышено количество попыток");
+                    _validationResult.Status = "needauth";
+                    _validationResult.Message = $"Требуется код подтверждения (попытки исчерпаны)";
+                    _tcs?.TrySetResult(_validationResult);
+                    _isRunning = false;
+                    return;
+                }
+
+                Console.WriteLine($"[2FA] Требуется код подтверждения, отправлен на {callback.EmailDomain}");
+                Console.Write($"[2FA] Введите код (попытка {_codeAttempts}/{MaxCodeAttempts}): ");
+                _authCode = Console.ReadLine()?.Trim();
+
+                if (string.IsNullOrEmpty(_authCode))
+                {
+                    Console.WriteLine("[2FA] Код не введён");
+                    _validationResult.Status = "needauth";
+                    _validationResult.Message = "Код не введён";
+                    _tcs?.TrySetResult(_validationResult);
+                    _isRunning = false;
+                    return;
+                }
+
+                Console.WriteLine("[2FA] Код принят, ожидаем отключения и переподключения...");
+                // Дальше сервер сам отключит, и мы переподключимся в OnDisconnected
+                return;
+            }
+            else if (callback.Result == EResult.AccountLoginDeniedNeedTwoFactor)
+            {
+                _codeAttempts++;
+                if (_codeAttempts > MaxCodeAttempts)
+                {
+                    Console.WriteLine("[2FA] Превышено количество попыток");
+                    _validationResult.Status = "need2fa";
+                    _validationResult.Message = "Требуется код двухфакторной аутентификации (попытки исчерпаны)";
+                    _tcs?.TrySetResult(_validationResult);
+                    _isRunning = false;
+                    return;
+                }
+
+                Console.WriteLine($"[2FA] Требуется код двухфакторной аутентификации");
+                Console.Write($"[2FA] Введите код из приложения (попытка {_codeAttempts}/{MaxCodeAttempts}): ");
+                _twoFactorCode = Console.ReadLine()?.Trim();
+
+                if (string.IsNullOrEmpty(_twoFactorCode))
+                {
+                    Console.WriteLine("[2FA] Код не введён");
+                    _validationResult.Status = "need2fa";
+                    _validationResult.Message = "Код не введён";
+                    _tcs?.TrySetResult(_validationResult);
+                    _isRunning = false;
+                    return;
+                }
+
+                Console.WriteLine("[2FA] Код принят, ожидаем отключения и переподключения...");
+                return;
+            }
+            else if (callback.Result == EResult.InvalidLoginAuthCode)
+            {
+                _codeAttempts++;
+                if (_codeAttempts > MaxCodeAttempts)
+                {
+                    Console.WriteLine("[2FA] Превышено количество попыток");
+                    _validationResult.Status = "error";
+                    _validationResult.Message = "Неверный код подтверждения (попытки исчерпаны)";
+                    _tcs?.TrySetResult(_validationResult);
+                    _isRunning = false;
+                    return;
+                }
+
+                Console.WriteLine($"[2FA] Неверный код подтверждения. Попытка {_codeAttempts}/{MaxCodeAttempts}");
+                Console.Write("[2FA] Введите код ещё раз: ");
+                _authCode = Console.ReadLine()?.Trim();
+
+                if (string.IsNullOrEmpty(_authCode))
+                {
+                    Console.WriteLine("[2FA] Код не введён");
+                    _validationResult.Status = "error";
+                    _validationResult.Message = "Код не введён";
+                    _tcs?.TrySetResult(_validationResult);
+                    _isRunning = false;
+                    return;
+                }
+
+                Console.WriteLine("[2FA] Код принят, ожидаем отключения и переподключения...");
+                return;
+            }
+            else if (callback.Result != EResult.OK)
+            {
+                Console.WriteLine($"[ERROR] Ошибка входа: {callback.Result}");
+                _validationResult.Status = "error";
+                _validationResult.Message = $"Ошибка входа: {callback.Result}";
+                _tcs?.TrySetResult(_validationResult);
+                _isRunning = false;
+                return;
+            }
+
+            // Успешный вход
+            Console.WriteLine("[SUCCESS] Вход выполнен успешно!");
+            _loginSuccess = true;
+            _codeAttempts = 0;
+
+            Console.WriteLine($"[KEY] Отправка ключа на активацию: {_keyToValidate}");
+            try
+            {
+                var registerKeyMsg = new ClientMsgProtobuf<CMsgClientRegisterKey>(EMsg.ClientRegisterKey);
+                registerKeyMsg.Body.key = _keyToValidate;
+                _steamClient.Send(registerKeyMsg);
+                Console.WriteLine("[KEY] Ключ отправлен, ожидаю ответ...");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERROR] Ошибка при отправке ключа: {ex.Message}");
+                _validationResult.Status = "error";
+                _validationResult.Message = $"Ошибка отправки ключа: {ex.Message}";
+                _tcs?.TrySetResult(_validationResult);
+                _isRunning = false;
+            }
+        }
+
+        private void OnLoggedOff(SteamUser.LoggedOffCallback callback)
+        {
+            Console.WriteLine($"[LOGGEDOFF] Выход из Steam: {callback.Result}");
+            if (_tcs != null && !_tcs.Task.IsCompleted && _validationResult.Status == "pending")
+            {
+                _validationResult.Status = "error";
+                _validationResult.Message = "Сессия завершена";
+                _tcs.TrySetResult(_validationResult);
+            }
+            _isRunning = false;
+        }
+
+        private void OnLoginKey(SteamUser.LoginKeyCallback callback)
+        {
+            _loginKey = callback.LoginKey;
+            SaveLoginKey(_loginKey);
+            _steamUser.AcceptNewLoginKey(callback);
+            Console.WriteLine("[LOGINKEY] Получен LoginKey для будущих входов");
+        }
+
+        private void OnMachineAuth(SteamUser.UpdateMachineAuthCallback callback)
+        {
+            Console.WriteLine("[SENTRY] Сохранение sentry файла...");
+            Console.WriteLine($"    Offset: {callback.Offset}, BytesToWrite: {callback.BytesToWrite}, Data.Length: {callback.Data.Length}");
+
+            try
+            {
+                if (File.Exists(SentryFile))
+                {
+                    var fi = new FileInfo(SentryFile);
+                    Console.WriteLine($"    Текущий размер файла: {fi.Length} байт");
+                }
+
+                File.WriteAllBytes(SentryFile, callback.Data);
+                Console.WriteLine($"    Файл записан, новый размер: {callback.Data.Length} байт");
+
+                _steamUser.SendMachineAuthResponse(new SteamUser.MachineAuthDetails
+                {
+                    JobID = callback.JobID,
+                    FileName = callback.FileName,
+                    BytesWritten = callback.BytesToWrite,
+                    FileSize = callback.Data.Length,
+                    Offset = callback.Offset,
+                    Result = EResult.OK,
+                    LastError = 0,
+                    OneTimePassword = callback.OneTimePassword,
+                    SentryFileHash = CryptoHelper.SHAHash(callback.Data),
+                });
+
+                _sentryFile = callback.Data;
+                Console.WriteLine("[SENTRY] Файл сохранён.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SENTRY] Ошибка сохранения: {ex.Message}");
+            }
+        }
+
+        private void OnPurchaseResult(SteamApps.PurchaseResponseCallback callback)
+        {
+            Console.WriteLine("\n[PURCHASE] ПОЛУЧЕН ОТВЕТ ОТ STEAM");
+            Console.WriteLine($"  Результат: {callback.Result}");
+            Console.WriteLine($"  Детальный результат: {callback.PurchaseResultDetail}");
+
+            string status;
+            string message;
+
+            switch (callback.Result)
+            {
+                case EResult.OK:
+                    status = "success";
+                    message = "Ключ успешно активирован";
+                    if (callback.PurchaseReceiptInfo != null)
+                    {
+                        try
+                        {
+                            var lineItems = callback.PurchaseReceiptInfo["lineitems"].Children;
+                            if (lineItems.Count > 0)
+                            {
+                                var game = lineItems[0]["ItemDescription"].AsString();
+                                if (!string.IsNullOrEmpty(game))
+                                {
+                                    message += $". Игра: {game}";
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                    break;
+
+                case EResult.Fail:
+                    switch (callback.PurchaseResultDetail)
+                    {
+                        case EPurchaseResultDetail.DuplicateActivationCode:
+                            status = "duplicate";
+                            message = "Ключ уже был активирован ранее";
+                            break;
+                        case EPurchaseResultDetail.BadActivationCode:
+                            status = "invalid_format";
+                            message = "Неверный формат ключа";
+                            break;
+                        case EPurchaseResultDetail.AlreadyPurchased:
+                            status = "already_used";
+                            message = "Ключ уже был использован";
+                            break;
+                        case EPurchaseResultDetail.DoesNotOwnRequiredApp:
+                            status = "missing_game";
+                            message = "Для активации требуется базовая игра";
+                            break;
+                        case EPurchaseResultDetail.RestrictedCountry:
+                            status = "region_locked";
+                            message = "Ключ ограничен по региону";
+                            break;
+                        case EPurchaseResultDetail.CancelledByUser:
+                            status = "cancelled";
+                            message = "Активация отменена пользователем";
+                            break;
+                        case EPurchaseResultDetail.RateLimited:
+                            status = "rate_limited";
+                            message = "Слишком много попыток, попробуйте позже";
+                            break;
+                        default:
+                            status = "fail";
+                            message = $"Ошибка активации: {callback.PurchaseResultDetail}";
+                            break;
+                    }
+                    break;
+
+                case EResult.DuplicateName:
+                    status = "duplicate";
+                    message = "Ключ уже активирован на другом аккаунте";
+                    break;
+
+                case EResult.Invalid:
+                case EResult.InvalidParam:
+                    status = "invalid";
+                    message = "Недействительный ключ";
+                    break;
+
+                case EResult.Expired:
+                    status = "expired";
+                    message = "Срок действия ключа истёк";
+                    break;
+
+                case EResult.Revoked:
+                    status = "revoked";
+                    message = "Ключ был отозван разработчиком";
+                    break;
+
+                case EResult.Timeout:
+                    status = "timeout";
+                    message = "Превышено время ожидания ответа от Steam";
+                    break;
+
+                default:
+                    status = "error";
+                    message = $"Неизвестная ошибка: {callback.Result} / {callback.PurchaseResultDetail}";
+                    break;
+            }
+
+            Console.WriteLine($"[PURCHASE] Статус: {status}");
+            Console.WriteLine($"[PURCHASE] Сообщение: {message}");
+            Console.WriteLine("[PURCHASE] Завершение работы. Устанавливаем результат и _isRunning = false.");
+
+            _validationResult.Status = status;
+            _validationResult.Message = message;
+            _tcs?.TrySetResult(_validationResult);
+            _isRunning = false;
+            Console.WriteLine("[PURCHASE] _isRunning установлен в false, результат отправлен.");
+        }
+    }
+}

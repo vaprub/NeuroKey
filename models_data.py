@@ -13,7 +13,7 @@ class GiveawayResult:
     confidence_score: float
     detected_at: str = None
     is_active: bool = True
-    id: Optional[int] = None  # будет присвоено после сохранения в БД
+    id: Optional[int] = None
 
     def __post_init__(self):
         if self.detected_at is None:
@@ -28,12 +28,15 @@ class KeyResult:
     """Информация о найденном ключе, связанном с раздачей."""
     giveaway_id: int
     key: str
-    platform: Optional[str] = None          # определённая платформа
-    game_name: Optional[str] = None          # предположительное название игры
-    is_active: bool = True                    # активен ли ключ (не использован)
-    user_corrected_platform: Optional[str] = None  # исправление пользователя
-    user_corrected_game: Optional[str] = None      # исправление пользователя
-    user_checked: bool = False                    # проверял ли пользователь
+    platform: Optional[str] = None
+    game_name: Optional[str] = None
+    is_active: bool = True
+    user_corrected_platform: Optional[str] = None
+    user_corrected_game: Optional[str] = None
+    user_checked: bool = False
+    validation_status: Optional[str] = 'pending'  # pending, valid, invalid, error
+    validation_date: Optional[str] = None
+    validation_details: Optional[str] = None       # JSON с ответом API
     id: Optional[int] = None
     detected_at: str = None
 

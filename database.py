@@ -30,11 +30,8 @@ class DatabaseManager:
             conn.close()
 
     def init_database(self):
-        """Создаёт таблицы giveaways и keys, а также таблицу для обратной связи."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-
-            # Таблица раздач (без ключей)
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS giveaways (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,8 +45,6 @@ class DatabaseManager:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-
-            # Таблица ключей (связь многие-к-одному с giveaways)
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS keys (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,14 +56,15 @@ class DatabaseManager:
                     user_corrected_platform TEXT,
                     user_corrected_game TEXT,
                     user_checked BOOLEAN DEFAULT 0,
+                    validation_status TEXT DEFAULT 'pending',
+                    validation_date TIMESTAMP,
+                    validation_details TEXT,
                     detected_at TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (giveaway_id) REFERENCES giveaways (id) ON DELETE CASCADE,
-                    UNIQUE(giveaway_id, key)  -- предотвращаем дубли ключей в одной раздаче
+                    UNIQUE(giveaway_id, key)
                 )
             ''')
-
-            # Таблица для хранения обратной связи по исправлениям (для обучения)
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS feedback_keys (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,16 +77,13 @@ class DatabaseManager:
                     FOREIGN KEY (key_id) REFERENCES keys (id) ON DELETE CASCADE
                 )
             ''')
-
-            # Индексы для ускорения
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_giveaway_url ON giveaways(url)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_keys_giveaway ON keys(giveaway_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_keys_platform ON keys(platform)')
-            logger.info("База данных инициализирована (с таблицей keys)")
+            logger.info("База данных инициализирована (с таблицей keys и полями валидации)")
 
     # ----- Работа с раздачами -----
     def add_giveaway(self, giveaway: GiveawayResult) -> int:
-        """Добавляет раздачу и возвращает её ID."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
@@ -106,7 +99,6 @@ class DatabaseManager:
                 giveaway.detected_at,
                 giveaway.is_active
             ))
-            # Получаем id (существующей или только что вставленной записи)
             cursor.execute('SELECT id FROM giveaways WHERE url = ?', (giveaway.url,))
             row = cursor.fetchone()
             return row['id'] if row else None
@@ -149,7 +141,6 @@ class DatabaseManager:
 
     # ----- Работа с ключами -----
     def add_keys(self, keys: List[KeyResult]):
-        """Добавляет список ключей (batch insert)."""
         if not keys:
             return
         with self.get_connection() as conn:
@@ -158,15 +149,16 @@ class DatabaseManager:
                 try:
                     cursor.execute('''
                         INSERT OR IGNORE INTO keys
-                        (giveaway_id, key, platform, game_name, is_active, detected_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        (giveaway_id, key, platform, game_name, is_active, detected_at, validation_status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         k.giveaway_id,
                         k.key,
                         k.platform,
                         k.game_name,
                         k.is_active,
-                        k.detected_at
+                        k.detected_at,
+                        k.validation_status or 'pending'
                     ))
                 except Exception as e:
                     logger.error(f"Ошибка добавления ключа {k.key}: {e}")
@@ -185,6 +177,35 @@ class DatabaseManager:
                     user_corrected_platform=row['user_corrected_platform'],
                     user_corrected_game=row['user_corrected_game'],
                     user_checked=bool(row['user_checked']),
+                    validation_status=row['validation_status'],
+                    validation_date=row['validation_date'],
+                    validation_details=row['validation_details'],
+                    id=row['id'],
+                    detected_at=row['detected_at']
+                )
+                for row in cursor.fetchall()
+            ]
+
+    def get_keys_by_giveaway_ids(self, giveaway_ids: List[int]) -> List[KeyResult]:
+        if not giveaway_ids:
+            return []
+        placeholders = ','.join(['?'] * len(giveaway_ids))
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f'SELECT * FROM keys WHERE giveaway_id IN ({placeholders})', giveaway_ids)
+            return [
+                KeyResult(
+                    giveaway_id=row['giveaway_id'],
+                    key=row['key'],
+                    platform=row['platform'],
+                    game_name=row['game_name'],
+                    is_active=bool(row['is_active']),
+                    user_corrected_platform=row['user_corrected_platform'],
+                    user_corrected_game=row['user_corrected_game'],
+                    user_checked=bool(row['user_checked']),
+                    validation_status=row['validation_status'],
+                    validation_date=row['validation_date'],
+                    validation_details=row['validation_details'],
                     id=row['id'],
                     detected_at=row['detected_at']
                 )
@@ -192,13 +213,8 @@ class DatabaseManager:
             ]
 
     def get_all_keys(self, include_empty_giveaways=False) -> List[Tuple[GiveawayResult, List[KeyResult]]]:
-        """
-        Возвращает список кортежей (раздача, [ключи]).
-        Если include_empty_giveaways=False, то возвращаются только раздачи, у которых есть хотя бы один ключ.
-        """
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            # Получаем все раздачи
             cursor.execute('SELECT * FROM giveaways ORDER BY detected_at DESC')
             giveaways = cursor.fetchall()
             result = []
@@ -225,6 +241,9 @@ class DatabaseManager:
                         user_corrected_platform=row['user_corrected_platform'],
                         user_corrected_game=row['user_corrected_game'],
                         user_checked=bool(row['user_checked']),
+                        validation_status=row['validation_status'],
+                        validation_date=row['validation_date'],
+                        validation_details=row['validation_details'],
                         id=row['id'],
                         detected_at=row['detected_at']
                     )
@@ -234,12 +253,43 @@ class DatabaseManager:
                     result.append((giveaway, keys))
             return result
 
-    # ----- Обновление ключей (обратная связь) -----
-    def update_key_correction(self, key_id: int, corrected_platform: str = None, corrected_game: str = None):
-        """Обновляет поля user_corrected_platform и user_corrected_game, а также записывает обратную связь в feedback_keys."""
+    def get_unvalidated_keys(self, limit: int = 100) -> List[KeyResult]:
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            # Получаем текущие значения
+            cursor.execute('''
+                SELECT * FROM keys WHERE validation_status = 'pending' ORDER BY detected_at DESC LIMIT ?
+            ''', (limit,))
+            return [
+                KeyResult(
+                    giveaway_id=row['giveaway_id'],
+                    key=row['key'],
+                    platform=row['platform'],
+                    game_name=row['game_name'],
+                    is_active=bool(row['is_active']),
+                    user_corrected_platform=row['user_corrected_platform'],
+                    user_corrected_game=row['user_corrected_game'],
+                    user_checked=bool(row['user_checked']),
+                    validation_status=row['validation_status'],
+                    validation_date=row['validation_date'],
+                    validation_details=row['validation_details'],
+                    id=row['id'],
+                    detected_at=row['detected_at']
+                )
+                for row in cursor.fetchall()
+            ]
+
+    def update_key_validation(self, key_id: int, status: str, details: str = None):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE keys
+                SET validation_status = ?, validation_date = ?, validation_details = ?
+                WHERE id = ?
+            ''', (status, datetime.now().isoformat(), details, key_id))
+
+    def update_key_correction(self, key_id: int, corrected_platform: str = None, corrected_game: str = None):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
             cursor.execute('SELECT platform, game_name FROM keys WHERE id = ?', (key_id,))
             row = cursor.fetchone()
             if not row:
@@ -247,7 +297,6 @@ class DatabaseManager:
             original_platform = row['platform']
             original_game = row['game_name']
 
-            # Обновляем запись в keys
             update_fields = []
             params = []
             if corrected_platform is not None:
@@ -262,36 +311,11 @@ class DatabaseManager:
             params.append(key_id)
             cursor.execute(f'UPDATE keys SET {", ".join(update_fields)} WHERE id = ?', params)
 
-            # Сохраняем обратную связь
             cursor.execute('''
                 INSERT INTO feedback_keys (key_id, original_platform, original_game, corrected_platform, corrected_game)
                 VALUES (?, ?, ?, ?, ?)
             ''', (key_id, original_platform, original_game, corrected_platform, corrected_game))
 
-    def get_unchecked_keys(self, limit: int = 100) -> List[KeyResult]:
-        """Возвращает ключи, которые ещё не были проверены пользователем (user_checked = 0)."""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT * FROM keys WHERE user_checked = 0 ORDER BY detected_at DESC LIMIT ?
-            ''', (limit,))
-            return [
-                KeyResult(
-                    giveaway_id=row['giveaway_id'],
-                    key=row['key'],
-                    platform=row['platform'],
-                    game_name=row['game_name'],
-                    is_active=bool(row['is_active']),
-                    user_corrected_platform=row['user_corrected_platform'],
-                    user_corrected_game=row['user_corrected_game'],
-                    user_checked=bool(row['user_checked']),
-                    id=row['id'],
-                    detected_at=row['detected_at']
-                )
-                for row in cursor.fetchall()
-            ]
-
-    # ----- Статистика (примеры) -----
     def get_statistics(self) -> dict:
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -301,7 +325,10 @@ class DatabaseManager:
             total_keys = cursor.fetchone()[0]
             cursor.execute('SELECT COUNT(*) FROM keys WHERE user_checked = 1')
             checked_keys = cursor.fetchone()[0]
-            # За сегодня
+            cursor.execute('SELECT COUNT(*) FROM keys WHERE validation_status = "valid"')
+            valid_keys = cursor.fetchone()[0]
+            cursor.execute('SELECT COUNT(*) FROM keys WHERE validation_status = "invalid"')
+            invalid_keys = cursor.fetchone()[0]
             today = datetime.now().date().isoformat()
             cursor.execute('SELECT COUNT(*) FROM keys WHERE date(detected_at) = ?', (today,))
             today_keys = cursor.fetchone()[0]
@@ -309,5 +336,7 @@ class DatabaseManager:
                 'total_giveaways': total_giveaways,
                 'total_keys': total_keys,
                 'checked_keys': checked_keys,
+                'valid_keys': valid_keys,
+                'invalid_keys': invalid_keys,
                 'today_keys': today_keys
             }

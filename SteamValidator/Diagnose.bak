@@ -1,0 +1,56 @@
+using System;
+using System.Reflection;
+using System.Linq;
+using SteamKit2;
+
+namespace SteamDiagnose
+{
+    class Program
+    {
+        static void Main()
+        {
+            Console.WriteLine("=== Диагностика SteamKit2 ===\n");
+
+            // 1. Версия библиотеки
+            var asm = typeof(SteamClient).Assembly;
+            Console.WriteLine($"Версия SteamKit2: {asm.GetName().Version}");
+
+            // 2. Ищем все типы JobCallback
+            Console.WriteLine("\n--- Типы, похожие на JobCallback ---");
+            foreach (var type in asm.GetTypes())
+            {
+                if (type.Name.Contains("JobCallback") || type.Name.Contains("Job"))
+                {
+                    Console.WriteLine($"Найден тип: {type.FullName}");
+                    Console.WriteLine($"   Является обобщённым? {type.IsGenericType}");
+                    if (type.IsGenericType)
+                    {
+                        var genericArgs = type.GetGenericArguments();
+                        // Исправлено: явно указываем тип параметра
+                        var argsNames = genericArgs.Select(t => t.Name).ToArray();
+                        Console.WriteLine($"   Параметры: {string.Join(", ", argsNames)}");
+                    }
+                }
+            }
+
+            // 3. Ищем метод для отправки RegisterKey
+            Console.WriteLine("\n--- Методы для активации ключей ---");
+            var appsType = typeof(SteamApps);
+            if (appsType != null)
+            {
+                var methods = appsType.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly);
+                foreach (var method in methods)
+                {
+                    if (method.Name.Contains("RegisterKey") || method.Name.Contains("Purchase"))
+                    {
+                        Console.WriteLine($"Найден метод: {method.Name}");
+                        Console.WriteLine($"   Возвращает: {method.ReturnType}");
+                    }
+                }
+            }
+
+            Console.WriteLine("\nДиагностика завершена. Нажмите любую клавишу...");
+            Console.ReadKey();
+        }
+    }
+}

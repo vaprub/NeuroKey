@@ -3,8 +3,11 @@ import sys
 import os
 import logging
 import json
+import threading
 from datetime import datetime
 from pathlib import Path
+from account_manager import AccountManager
+from steam_2fa import Steam2FA
 
 # Настройка логирования
 logging.basicConfig(
@@ -36,6 +39,7 @@ from scanner_engine import GiveawayScanner
 from database import DatabaseManager
 from models import ModelManager
 from models_data import GiveawayResult, KeyResult
+from validator import SteamExeValidator
 
 # Создаём необходимые папки
 os.makedirs("data", exist_ok=True)
@@ -114,6 +118,8 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1024, 768)
 
         self.queries = []
+        self.account_manager = None  # будет инициализирован в init_components
+        self.current_validation_thread = None  # ← добавить эту строку
 
         self.init_components()
         self.init_ui()
@@ -124,7 +130,17 @@ class MainWindow(QMainWindow):
         try:
             self.db = DatabaseManager("data/giveaways.db")
             self.model_manager = ModelManager(model_dir="models")
+            self.account_manager = AccountManager()
             self.settings = self.load_settings()
+            
+            # Автоматически ищем SteamValidator.exe
+            if not os.path.exists(self.settings.get('steam_validator_exe', '')):
+                # Путь по умолчанию для вашей системы
+                default_path = r"C:\Users\vaprub\Desktop\NeuroKey\SteamValidator\bin\Release\net8.0\win-x64\SteamValidator.exe"
+                if os.path.exists(default_path):
+                    self.settings['steam_validator_exe'] = default_path
+                    logger.info(f"✅ Автоматически установлен путь к SteamValidator: {default_path}")
+            
             self.queries = self.settings.get('queries', [
                 "steam free games",
                 "gog giveaway",
@@ -136,6 +152,8 @@ class MainWindow(QMainWindow):
                 db_manager=self.db,
                 config=self.settings
             )
+            # Инициализируем валидатор Steam
+            self.steam_validator = SteamExeValidator(self.settings.get('steam_validator_exe', 'SteamValidator.exe'))
             self.threadpool = QThreadPool()
             self.auto_thread = None
             logger.info("✅ Компоненты инициализированы")
@@ -171,7 +189,9 @@ class MainWindow(QMainWindow):
             'auto_scan': False,
             'interval': 60,
             'timeout': 15,
-            'delay': 2
+            'delay': 2,
+            'steam_api_key': '',
+            'steam_validator_exe': 'SteamValidator.exe'
         }
         try:
             with open('data/settings.json', 'r', encoding='utf-8') as f:
@@ -209,6 +229,7 @@ class MainWindow(QMainWindow):
         self.settings['auto_add_sources'] = self.auto_add_sources_cb.isChecked()
         self.settings['min_source_success_rate'] = self.min_success_spin.value()
         self.settings['min_source_count'] = self.min_count_spin.value()
+        self.settings['steam_validator_exe'] = self.steam_exe_edit.text()
 
         queries_text = self.queries_edit.toPlainText().strip()
         self.settings['queries'] = [q.strip() for q in queries_text.split('\n') if q.strip()]
@@ -218,6 +239,7 @@ class MainWindow(QMainWindow):
             json.dump(self.settings, f, indent=2, ensure_ascii=False)
 
         self.scanner.update_config(self.settings)
+        self.steam_validator = SteamExeValidator(self.settings.get('steam_validator_exe', 'SteamValidator.exe'))
         if self.auto_thread is not None:
             self.stop_auto_scan()
             if self.auto_scan_cb.isChecked():
@@ -242,6 +264,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.create_scan_tab(), "🔍 Сканирование")
         self.tabs.addTab(self.create_results_tab(), "📋 Результаты")
         self.tabs.addTab(self.create_training_tab(), "🧠 Обучение")
+        self.tabs.addTab(self.create_accounts_tab(), "👤 Аккаунты")
         self.tabs.addTab(self.create_settings_tab(), "⚙️ Настройки")
 
         main_layout.addWidget(self.tabs)
@@ -416,13 +439,11 @@ class MainWindow(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        # Чекбокс "Показать раздачи без ключей"
         self.show_empty_cb = QCheckBox("Показать раздачи без ключей")
         self.show_empty_cb.setChecked(False)
         self.show_empty_cb.toggled.connect(self.load_results)
         layout.addWidget(self.show_empty_cb)
 
-        # Дерево результатов (раздачи и ключи)
         self.tree_results = QTreeWidget()
         self.tree_results.setHeaderLabels([
             "Раздача / Ключ", "Игра", "Платформа", "Статус", "Дата"
@@ -436,29 +457,32 @@ class MainWindow(QMainWindow):
 
     def show_key_context_menu(self, position):
         item = self.tree_results.itemAt(position)
-        if not item or item.parent() is None:  # контекстное меню только для ключей (дочерних)
+        if not item or item.parent() is None:
             return
 
         key_id = item.data(0, Qt.UserRole)
         if not key_id:
             return
 
+        platform = item.text(2)
         menu = QMenu()
 
-        # Исправить название игры
         action_game = QAction("Исправить название игры", self)
         action_game.triggered.connect(lambda: self.correct_game(item, key_id))
         menu.addAction(action_game)
 
-        # Исправить платформу
         action_platform = QAction("Исправить платформу", self)
         action_platform.triggered.connect(lambda: self.correct_platform(item, key_id))
         menu.addAction(action_platform)
 
-        # Отметить как проверенный
         action_check = QAction("Отметить как проверенный", self)
         action_check.triggered.connect(lambda: self.mark_key_checked(item, key_id))
         menu.addAction(action_check)
+
+        if platform == 'Steam' and hasattr(self, 'steam_validator') and self.steam_validator.available:
+            action_validate = QAction("Валидировать через Steam", self)
+            action_validate.triggered.connect(lambda: self.validate_key_with_steam(item, key_id))
+            menu.addAction(action_validate)
 
         menu.exec_(self.tree_results.viewport().mapToGlobal(position))
 
@@ -475,7 +499,6 @@ class MainWindow(QMainWindow):
     def correct_platform(self, item, key_id):
         platforms = ["Steam", "GOG", "Epic", "Xbox", "PlayStation", "Nintendo", "Battle.net", "Origin", "Uplay", "Itch.io", "Другое"]
         current_platform = item.text(2) or ""
-        # Покажем диалог с выпадающим списком
         combo = QComboBox()
         combo.addItems(platforms)
         combo.setEditable(True)
@@ -501,10 +524,83 @@ class MainWindow(QMainWindow):
                 self.log_message(f"💾 Для ключа ID {key_id} исправлена платформа на {new_platform}")
 
     def mark_key_checked(self, item, key_id):
-        # Помечаем как проверенный без изменения игры/платформы
-        self.db.update_key_correction(key_id, corrected_platform=None, corrected_game=None)  # просто ставим user_checked=1
-        item.setText(3, "проверен")
+        self.db.update_key_correction(key_id, corrected_platform=None, corrected_game=None)
+        item.setText(3, "проверен (ручн.)")
         self.log_message(f"✅ Ключ ID {key_id} отмечен как проверенный")
+
+    def validate_key_with_steam(self, item, key_id):
+        key = item.text(0)
+
+        # Получаем список сохранённых аккаунтов
+        accounts = self.account_manager.list_accounts()
+        if not accounts:
+            reply = QMessageBox.question(
+                self,
+                "Нет аккаунтов",
+                "У вас нет сохранённых аккаунтов Steam.\nХотите добавить сейчас?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                # Переключаемся на вкладку "Аккаунты" (индекс 5, если вкладки: 0-Дашборд,1-Скан,2-Результаты,3-Обучение,4-Настройки,5-Аккаунты)
+                self.tabs.setCurrentIndex(5)
+            return
+
+        # Выбираем аккаунт
+        if len(accounts) == 1:
+            selected_login = accounts[0]
+        else:
+            selected_login, ok = QInputDialog.getItem(
+                self,
+                "Выбор аккаунта",
+                "Выберите аккаунт для валидации:",
+                accounts,
+                0,
+                False
+            )
+            if not ok:
+                return
+
+        self.log_message(f"🔄 Валидация ключа {key} через Steam с аккаунтом {selected_login}...")
+
+        # Поток для валидации
+        class ValidateThread(QThread):
+            finished = pyqtSignal(dict)
+
+            def __init__(self, validator, key, login):
+                super().__init__()
+                self.validator = validator
+                self.key = key
+                self.login = login
+
+            def run(self):
+                result = self.validator.validate(self.key, login=self.login)
+                self.finished.emit(result)
+
+        thread = ValidateThread(self.steam_validator, key, selected_login)
+        thread.finished.connect(lambda res: self.on_validation_complete(item, key_id, res, thread))
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+        self.current_validation_thread = thread
+
+    def on_validation_complete(self, item, key_id, result, thread):
+        if result['valid']:
+            status_text = f"✓ валидный ({result.get('game', '?')})"
+            color = QColor(0, 180, 0)  # зелёный
+            self.db.update_key_validation(key_id, 'valid', json.dumps(result))
+            self.log_message(f"✅ Ключ валиден: {result.get('game', '?')}")
+        else:
+            status_text = f"✗ {result.get('message', 'ошибка')}"
+            color = QColor(200, 0, 0)  # красный
+            self.db.update_key_validation(key_id, 'invalid', json.dumps(result))
+            self.log_message(f"❌ {result.get('message', 'ошибка')}")
+        
+        # Обновляем отображение
+        item.setText(3, status_text)
+        item.setForeground(3, QBrush(color))
+        self.load_results()  # перезагружаем всё дерево для консистентности
+        
+        # Очищаем ссылку на поток
+        self.current_validation_thread = None
 
     def create_training_tab(self):
         widget = QWidget()
@@ -656,6 +752,16 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(auto_sources_group)
 
+        # === Группа валидации ключей ===
+        validation_group = QGroupBox("Валидация ключей Steam")
+        validation_layout = QFormLayout(validation_group)
+
+        self.steam_exe_edit = QLineEdit()
+        self.steam_exe_edit.setText(self.settings.get('steam_validator_exe', 'SteamValidator.exe'))
+        validation_layout.addRow("Путь к SteamValidator.exe:", self.steam_exe_edit)
+
+        layout.addWidget(validation_group)
+
         # === Настройки сканирования (таймауты) ===
         scan_group = QGroupBox("Сканирование")
         scan_layout = QFormLayout(scan_group)
@@ -670,6 +776,7 @@ class MainWindow(QMainWindow):
         scan_layout.addRow("Задержка (сек):", self.delay_spin)
         layout.addWidget(scan_group)
 
+        # Кнопки сохранения/сброса
         buttons_layout = QHBoxLayout()
         save_btn = QPushButton("💾 Сохранить")
         save_btn.clicked.connect(self.save_settings)
@@ -682,6 +789,150 @@ class MainWindow(QMainWindow):
         layout.addStretch()
 
         return widget
+        
+    def create_accounts_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        # Список аккаунтов
+        self.accounts_list = QListWidget()
+        self.accounts_list.itemSelectionChanged.connect(self.on_account_selected)
+        layout.addWidget(self.accounts_list)
+
+        # Кнопки управления
+        btn_layout = QHBoxLayout()
+        add_btn = QPushButton("➕ Добавить аккаунт")
+        add_btn.clicked.connect(self.add_account_dialog)
+        btn_layout.addWidget(add_btn)
+
+        edit_btn = QPushButton("✏️ Редактировать")
+        edit_btn.clicked.connect(self.edit_account_dialog)
+        btn_layout.addWidget(edit_btn)
+
+        remove_btn = QPushButton("🗑️ Удалить")
+        remove_btn.clicked.connect(self.remove_account)
+        btn_layout.addWidget(remove_btn)
+
+        layout.addLayout(btn_layout)
+
+        # Поле для shared_secret
+        secret_group = QGroupBox("2FA секрет (shared_secret)")
+        secret_layout = QFormLayout(secret_group)
+        self.secret_edit = QLineEdit()
+        self.secret_edit.setPlaceholderText("Вставьте shared_secret из приложения")
+        secret_layout.addRow("Secret:", self.secret_edit)
+
+        save_secret_btn = QPushButton("💾 Сохранить секрет")
+        save_secret_btn.clicked.connect(self.save_shared_secret)
+        secret_layout.addRow(save_secret_btn)
+
+        layout.addWidget(secret_group)
+
+        # Загружаем список аккаунтов
+        self.refresh_accounts_list()
+        return widget
+        
+    def refresh_accounts_list(self):
+        self.accounts_list.clear()
+        for login in self.account_manager.list_accounts():
+            self.accounts_list.addItem(login)
+
+    def on_account_selected(self):
+        selected = self.accounts_list.currentItem()
+        if selected:
+            login = selected.text()
+            account = self.account_manager.get_account(login)
+            if account and account.get('shared_secret'):
+                self.secret_edit.setText(account['shared_secret'])
+            else:
+                self.secret_edit.clear()
+
+    def add_account_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Добавление аккаунта Steam")
+        layout = QFormLayout(dialog)
+
+        login_edit = QLineEdit()
+        password_edit = QLineEdit()
+        password_edit.setEchoMode(QLineEdit.Password)
+
+        layout.addRow("Логин:", login_edit)
+        layout.addRow("Пароль:", password_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+
+        if dialog.exec_() == QDialog.Accepted:
+            login = login_edit.text().strip()
+            password = password_edit.text()
+            if login and password:
+                self.account_manager.add_account(login, password, "")
+                self.refresh_accounts_list()
+                self.log_message(f"✅ Аккаунт {login} добавлен")
+            else:
+                QMessageBox.warning(self, "Ошибка", "Логин и пароль обязательны")
+
+        def edit_account_dialog(self):
+            selected = self.accounts_list.currentItem()
+            if not selected:
+                QMessageBox.warning(self, "Ошибка", "Выберите аккаунт")
+                return
+            login = selected.text()
+            account = self.account_manager.get_account(login)
+
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Редактирование {login}")
+            layout = QFormLayout(dialog)
+
+            login_edit = QLineEdit(login)
+            login_edit.setReadOnly(True)
+            password_edit = QLineEdit()
+            password_edit.setEchoMode(QLineEdit.Password)
+            password_edit.setText(account['password'])
+
+            layout.addRow("Логин:", login_edit)
+            layout.addRow("Пароль:", password_edit)
+
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addRow(buttons)
+
+            if dialog.exec_() == QDialog.Accepted:
+                new_password = password_edit.text()
+                if new_password:
+                    self.account_manager.add_account(login, new_password, account.get('shared_secret', ''))
+                    self.log_message(f"✅ Аккаунт {login} обновлён")
+
+    def remove_account(self):
+        selected = self.accounts_list.currentItem()
+        if not selected:
+            QMessageBox.warning(self, "Ошибка", "Выберите аккаунт")
+            return
+        login = selected.text()
+        reply = QMessageBox.question(self, "Подтверждение", f"Удалить аккаунт {login}?",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.account_manager.remove_account(login)
+            self.refresh_accounts_list()
+            self.secret_edit.clear()
+            self.log_message(f"✅ Аккаунт {login} удалён")
+
+    def save_shared_secret(self):
+        selected = self.accounts_list.currentItem()
+        if not selected:
+            QMessageBox.warning(self, "Ошибка", "Выберите аккаунт")
+            return
+        login = selected.text()
+        secret = self.secret_edit.text().strip()
+        if secret:
+            account = self.account_manager.get_account(login)
+            self.account_manager.add_account(login, account['password'], secret)
+            self.log_message(f"✅ Секрет сохранён для {login}")
+        else:
+            QMessageBox.warning(self, "Ошибка", "Введите секрет")
 
     def create_log_panel(self):
         panel = QGroupBox("Логи")
@@ -719,7 +970,6 @@ class MainWindow(QMainWindow):
             try:
                 import pandas as pd
                 data = []
-                # Получаем все раздачи с ключами
                 items = self.db.get_all_keys(include_empty_giveaways=False)
                 for giveaway, keys in items:
                     for key in keys:
@@ -735,6 +985,8 @@ class MainWindow(QMainWindow):
                             'user_corrected_platform': key.user_corrected_platform,
                             'user_corrected_game': key.user_corrected_game,
                             'user_checked': key.user_checked,
+                            'validation_status': key.validation_status,
+                            'validation_date': key.validation_date,
                             'detected_at': key.detected_at
                         })
                 df = pd.DataFrame(data)
@@ -785,14 +1037,15 @@ class MainWindow(QMainWindow):
             conf_item = QTableWidgetItem(f"{r.confidence_score:.1%}")
             conf_item.setTextAlignment(Qt.AlignCenter)
             self.scan_results_table.setItem(i, 3, conf_item)
-            # Количество ключей (нужно получить из БД, но мы их ещё не сохранили? В results только раздачи)
-            # Пока просто покажем, что ключи есть (позже)
-            keys_count = "?"  # можно позже улучшить
+            keys_count = "?"  # можно улучшить
             self.scan_results_table.setItem(i, 4, QTableWidgetItem(keys_count))
-            # Теги не сохраняются в giveaway, можно будет потом
             self.scan_results_table.setItem(i, 5, QTableWidgetItem(""))
         self.scan_results_table.resizeColumnsToContents()
-        self.load_results()  # обновим дерево результатов
+        # Автоматически проверяем новые ключи
+        giveaway_ids = [r.id for r in results if r.id is not None]
+        if giveaway_ids:
+            QTimer.singleShot(0, lambda: self.validate_new_keys(giveaway_ids))
+        self.load_results()
         self.update_dashboard()
 
     def on_scan_error(self, error_msg):
@@ -835,19 +1088,17 @@ class MainWindow(QMainWindow):
         self.log_message(f"🎉 Найдено {len(results)} новых раздач с ключами!")
         if self.notify_sound_cb.isChecked():
             QApplication.beep()
-        if self.auto_gen_queries_cb.isChecked():
-            self.generate_queries_from_tags()
-        if self.auto_add_sources_cb.isChecked():
-            self.analyze_and_add_sources()
+        giveaway_ids = [r.id for r in results if r.id is not None]
+        if giveaway_ids:
+            self.validate_new_keys(giveaway_ids)
         self.update_dashboard()
         self.load_results()
 
-    def generate_queries_from_tags(self):
-        # Упрощённо: пока не используем теги
-        pass
-
-    def analyze_and_add_sources(self):
-        # Упрощённо: пока не используем
+    def validate_new_keys(self, giveaway_ids: list):
+        """Автоматически проверяет ключи для указанных раздач."""
+        if not giveaway_ids:
+            return
+        # Здесь можно добавить автоматическую валидацию
         pass
 
     def update_dashboard(self):
@@ -861,7 +1112,6 @@ class MainWindow(QMainWindow):
                 elif widget.objectName() == "card_📅 Сегодня":
                     widget.setText(str(stats['today_keys']))
                 elif widget.objectName() == "card_🎯 Точность":
-                    # Простейшая метрика: доля проверенных ключей
                     total = stats['total_keys']
                     checked = stats['checked_keys']
                     acc = (checked / total * 100) if total > 0 else 0
@@ -873,7 +1123,7 @@ class MainWindow(QMainWindow):
             logger.error(f"Ошибка обновления дашборда: {e}")
 
     def update_activity_plot(self):
-        # Заглушка – можно реализовать позже
+        # Заглушка
         pass
 
     def update_sources_list(self):
@@ -889,7 +1139,6 @@ class MainWindow(QMainWindow):
                 self.recent_table.setItem(i, 0, QTableWidgetItem(giveaway.title[:50]))
                 self.recent_table.setItem(i, 1, QTableWidgetItem(giveaway.source_site))
                 self.recent_table.setItem(i, 2, QTableWidgetItem(str(len(keys))))
-                # теги пока не используем
                 self.recent_table.setItem(i, 3, QTableWidgetItem(""))
                 self.recent_table.setItem(i, 4, QTableWidgetItem(
                     giveaway.detected_at.split('T')[0] if 'T' in giveaway.detected_at else giveaway.detected_at[:10]
@@ -903,27 +1152,42 @@ class MainWindow(QMainWindow):
         items = self.db.get_all_keys(include_empty_giveaways=self.show_empty_cb.isChecked())
 
         for giveaway, keys in items:
-            # Родительский элемент – раздача
             parent = QTreeWidgetItem(self.tree_results)
             parent.setText(0, giveaway.title)
-            parent.setText(1, "")  # игра не на уровне раздачи
-            parent.setText(2, "")  # платформа
+            parent.setText(1, "")
+            parent.setText(2, "")
             parent.setText(3, "")
             parent.setText(4, giveaway.detected_at.split('T')[0] if 'T' in giveaway.detected_at else giveaway.detected_at[:10])
-            parent.setData(0, Qt.UserRole, giveaway.id)  # храним giveaway_id для связи
+            parent.setData(0, Qt.UserRole, giveaway.id)
 
-            # Дочерние элементы – ключи
             for key in keys:
                 child = QTreeWidgetItem(parent)
                 child.setText(0, key.key)
                 child.setText(1, key.game_name or "?")
                 child.setText(2, key.platform or "?")
-                if key.user_checked:
-                    child.setText(3, "проверен")
-                else:
-                    child.setText(3, "не проверен")
                 child.setText(4, "")
-                child.setData(0, Qt.UserRole, key.id)  # храним key_id
+
+                # Определяем цвет статуса
+                if key.user_checked:
+                    status_text = "проверен (ручн.)"
+                    color = QColor(0, 150, 0)
+                elif key.validation_status == 'valid':
+                    status_text = "✓ валидный"
+                    color = QColor(0, 180, 0)
+                elif key.validation_status == 'invalid':
+                    status_text = "✗ невалидный"
+                    color = QColor(200, 0, 0)
+                elif key.validation_status == 'pending':
+                    status_text = "⏳ проверка..."
+                    color = QColor(255, 140, 0)
+                else:
+                    status_text = "не проверен"
+                    color = QColor(128, 128, 128)
+
+                child.setText(3, status_text)
+                child.setForeground(3, QBrush(color))
+                child.setData(0, Qt.UserRole, key.id)
+
             parent.setExpanded(True)
 
         self.tree_results.resizeColumnToContents(0)
@@ -973,7 +1237,9 @@ class MainWindow(QMainWindow):
             'auto_scan': False,
             'interval': 60,
             'timeout': 15,
-            'delay': 2
+            'delay': 2,
+            'steam_api_key': '',
+            'steam_validator_exe': 'SteamValidator.exe'
         }
         self.settings = default
         with open('data/settings.json', 'w', encoding='utf-8') as f:
@@ -997,15 +1263,34 @@ class MainWindow(QMainWindow):
         self.auto_add_sources_cb.setChecked(default['auto_add_sources'])
         self.min_success_spin.setValue(default['min_source_success_rate'])
         self.min_count_spin.setValue(default['min_source_count'])
+        self.steam_exe_edit.setText(default['steam_validator_exe'])
 
         self.log_message("Настройки сброшены к значениям по умолчанию")
         self.scanner.update_config(self.settings)
 
     def closeEvent(self, event):
+        logger.info("🛑 Завершение работы программы...")
+        
+        # Останавливаем поток валидации если он ещё работает
+        if hasattr(self, 'current_validation_thread') and self.current_validation_thread and self.current_validation_thread.isRunning():
+            logger.info("Ожидание завершения потока валидации...")
+            self.current_validation_thread.wait(5000)
+        
+        # Останавливаем автосканирование
         if self.auto_thread:
+            logger.info("Останавливаем поток автосканирования...")
             self.auto_thread.stop()
-            if not self.auto_thread.wait(5000):
-                logger.warning("Автосканер не завершился вовремя, принудительно")
+            # Даём потоку время завершиться
+            if not self.auto_thread.wait(3000):
+                logger.warning("Поток автосканирования не завершился вовремя")
+            self.auto_thread = None
+        
+        # Останавливаем все рабочие потоки в пуле
+        if self.threadpool:
+            logger.info("Ожидание завершения рабочих потоков...")
+            self.threadpool.waitForDone(3000)
+        
+        logger.info("✅ Программа завершена")
         event.accept()
 
 

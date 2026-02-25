@@ -1,0 +1,5 @@
+C:\Users\vaprub\Desktop\NeuroKey\SteamValidator\obj\Debug\net8.0\win-x64\SteamValidator.csproj.AssemblyReference.cache
+C:\Users\vaprub\Desktop\NeuroKey\SteamValidator\obj\Debug\net8.0\win-x64\SteamValidator.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\vaprub\Desktop\NeuroKey\SteamValidator\obj\Debug\net8.0\win-x64\SteamValidator.AssemblyInfoInputs.cache
+C:\Users\vaprub\Desktop\NeuroKey\SteamValidator\obj\Debug\net8.0\win-x64\SteamValidator.AssemblyInfo.cs
+C:\Users\vaprub\Desktop\NeuroKey\SteamValidator\obj\Debug\net8.0\win-x64\SteamValidator.csproj.CoreCompileInputs.cache

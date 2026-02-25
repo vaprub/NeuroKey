@@ -14,21 +14,54 @@ from database import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
+# Общий список User-Agent для ротации
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+]
+
+# Базовые заголовки, общие для всех запросов
+BASE_HEADERS = {
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'DNT': '1',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Cache-Control': 'max-age=0',
+}
 
 class WebParser:
-    # ... (без изменений, оставляем как в предыдущей версии) ...
     def __init__(self, timeout=15, delay=2):
         self.timeout = timeout
         self.delay = delay
         self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
+        # Заголовки будут дополняться в каждом запросе (User-Agent, Cookie)
+
+    def _get_headers(self) -> Dict:
+        """Возвращает заголовки для запроса со случайным User-Agent и куками."""
+        return {
+            **BASE_HEADERS,
+            'User-Agent': random.choice(USER_AGENTS),
+            'Cookie': 'over18=1; _ga=GA1.2.123456789.1678901234; _gid=GA1.2.987654321.1678901234'
+        }
 
     def extract_content(self, url: str) -> Optional[Dict]:
-        # (полный код метода из предыдущей версии, он уже есть)
         try:
-            response = self.session.get(url, timeout=self.timeout)
+            # Для Reddit используем старую версию
+            if 'reddit.com' in url and 'old.' not in url:
+                url = url.replace('www.reddit.com', 'old.reddit.com')
+                url = url.replace('reddit.com', 'old.reddit.com')
+
+            headers = self._get_headers()
+            response = self.session.get(url, headers=headers, timeout=self.timeout)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'lxml')
             for script in soup(['script', 'style', 'nav', 'footer', 'header']):
@@ -46,7 +79,7 @@ class WebParser:
             return None
 
     def _extract_tags(self, soup: BeautifulSoup, url: str) -> List[str]:
-        # (без изменений)
+        # ... (без изменений) ...
         tags = set()
         meta_keywords = soup.find('meta', attrs={'name': 'keywords'})
         if meta_keywords and meta_keywords.get('content'):
@@ -72,29 +105,17 @@ class WebParser:
 
 
 class WebSearcher:
-    # ... (без изменений, оставляем с ротацией UA и т.д.) ...
-    USER_AGENTS = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15',
-    ]
-
     def __init__(self, delay_range=(3, 7)):
         self.delay_range = delay_range
         self.session = requests.Session()
-        self.session.headers.update({
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0',
-        })
+
+    def _get_headers(self) -> Dict:
+        """Возвращает заголовки для запроса со случайным User-Agent и куками."""
+        return {
+            **BASE_HEADERS,
+            'User-Agent': random.choice(USER_AGENTS),
+            'Cookie': 'over18=1; _ga=GA1.2.123456789.1678901234; _gid=GA1.2.987654321.1678901234'
+        }
 
     def _fetch_soup(self, url: str) -> Optional[BeautifulSoup]:
         try:
@@ -103,10 +124,7 @@ class WebSearcher:
             if 'reddit.com' in url and 'old.' not in url:
                 url = url.replace('www.reddit.com', 'old.reddit.com')
                 url = url.replace('reddit.com', 'old.reddit.com')
-            headers = {
-                'User-Agent': random.choice(self.USER_AGENTS),
-                'Cookie': 'over18=1; _ga=GA1.2.123456789.1678901234; _gid=GA1.2.987654321.1678901234'
-            }
+            headers = self._get_headers()
             resp = self.session.get(url, headers=headers, timeout=10)
             resp.raise_for_status()
             return BeautifulSoup(resp.text, 'lxml')
@@ -164,6 +182,7 @@ class WebSearcher:
 
 
 class GiveawayScanner:
+    # ... (без изменений, как в вашем файле) ...
     def __init__(self, model_manager, db_manager, config: dict = None):
         self.model_manager = model_manager
         self.db_manager = db_manager
@@ -237,15 +256,11 @@ class GiveawayScanner:
             relevance = self.model_manager.analyze_relevance(text_for_analysis)
 
             if relevance > 0.25:
-                # Извлекаем ключи
                 key_strings = self.model_manager.extract_keys(content['text'])
                 if not key_strings:
-                    # Если ключей нет – пропускаем раздачу (если не хотим сохранять пустые)
-                    # Можно изменить логику, если нужно сохранять раздачи без ключей.
                     logger.debug("Ключи не найдены, раздача не сохраняется.")
                     continue
 
-                # Создаём запись раздачи
                 giveaway = GiveawayResult(
                     title=content['title'],
                     url=site,
@@ -253,13 +268,11 @@ class GiveawayScanner:
                     description=content['text'][:500] + "...",
                     confidence_score=float(relevance)
                 )
-                # Сохраняем раздачу, получаем её ID
                 giveaway_id = self.db_manager.add_giveaway(giveaway)
                 if not giveaway_id:
                     logger.error(f"Не удалось сохранить раздачу {site}")
                     continue
 
-                # Сохраняем ключи
                 key_objects = []
                 for k in key_strings:
                     platform = guess_platform(k)
