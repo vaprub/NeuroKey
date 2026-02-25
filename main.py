@@ -118,8 +118,8 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1024, 768)
 
         self.queries = []
-        self.account_manager = None  # будет инициализирован в init_components
-        self.current_validation_thread = None  # ← добавить эту строку
+        self.current_validation_thread = None
+        self.account_manager = None
 
         self.init_components()
         self.init_ui()
@@ -135,7 +135,6 @@ class MainWindow(QMainWindow):
             
             # Автоматически ищем SteamValidator.exe
             if not os.path.exists(self.settings.get('steam_validator_exe', '')):
-                # Путь по умолчанию для вашей системы
                 default_path = r"C:\Users\vaprub\Desktop\NeuroKey\SteamValidator\bin\Release\net8.0\win-x64\SteamValidator.exe"
                 if os.path.exists(default_path):
                     self.settings['steam_validator_exe'] = default_path
@@ -152,7 +151,6 @@ class MainWindow(QMainWindow):
                 db_manager=self.db,
                 config=self.settings
             )
-            # Инициализируем валидатор Steam
             self.steam_validator = SteamExeValidator(self.settings.get('steam_validator_exe', 'SteamValidator.exe'))
             self.threadpool = QThreadPool()
             self.auto_thread = None
@@ -378,6 +376,269 @@ class MainWindow(QMainWindow):
         layout.addWidget(title_label)
         layout.addWidget(value_label)
         return card
+
+    # ---------- Вкладка "Аккаунты" ----------
+    def create_accounts_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        # Список аккаунтов
+        self.accounts_list = QListWidget()
+        self.accounts_list.itemSelectionChanged.connect(self.on_account_selected)
+        layout.addWidget(self.accounts_list)
+
+        # Кнопки управления
+        btn_layout = QHBoxLayout()
+        add_btn = QPushButton("➕ Добавить аккаунт")
+        add_btn.clicked.connect(self.add_account_dialog)
+        btn_layout.addWidget(add_btn)
+
+        edit_btn = QPushButton("✏️ Редактировать")
+        edit_btn.clicked.connect(self.edit_account_dialog)
+        btn_layout.addWidget(edit_btn)
+
+        remove_btn = QPushButton("🗑️ Удалить")
+        remove_btn.clicked.connect(self.remove_account)
+        btn_layout.addWidget(remove_btn)
+
+        layout.addLayout(btn_layout)
+
+        # Поле для shared_secret и кнопка привязки
+        secret_group = QGroupBox("2FA секрет (shared_secret)")
+        secret_layout = QFormLayout(secret_group)
+        self.secret_edit = QLineEdit()
+        self.secret_edit.setPlaceholderText("Вставьте shared_secret или нажмите кнопку справа")
+        secret_layout.addRow("Secret:", self.secret_edit)
+
+        link_btn = QPushButton("🔐 Привязать Steam Guard")
+        link_btn.clicked.connect(self.link_steam_authenticator)
+        secret_layout.addRow(link_btn)
+
+        save_secret_btn = QPushButton("💾 Сохранить секрет")
+        save_secret_btn.clicked.connect(self.save_shared_secret)
+        secret_layout.addRow(save_secret_btn)
+
+        layout.addWidget(secret_group)
+
+        self.refresh_accounts_list()
+        return widget
+
+    def refresh_accounts_list(self):
+        self.accounts_list.clear()
+        for login in self.account_manager.list_accounts():
+            self.accounts_list.addItem(login)
+
+    def on_account_selected(self):
+        selected = self.accounts_list.currentItem()
+        if selected:
+            login = selected.text()
+            account = self.account_manager.get_account(login)
+            if account and account.get('shared_secret'):
+                self.secret_edit.setText(account['shared_secret'])
+            else:
+                self.secret_edit.clear()
+
+    def add_account_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Добавление аккаунта Steam")
+        layout = QFormLayout(dialog)
+
+        login_edit = QLineEdit()
+        password_edit = QLineEdit()
+        password_edit.setEchoMode(QLineEdit.Password)
+
+        layout.addRow("Логин:", login_edit)
+        layout.addRow("Пароль:", password_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+
+        if dialog.exec_() == QDialog.Accepted:
+            login = login_edit.text().strip()
+            password = password_edit.text()
+            if login and password:
+                self.account_manager.add_account(login, password, "")
+                self.refresh_accounts_list()
+                self.log_message(f"✅ Аккаунт {login} добавлен")
+            else:
+                QMessageBox.warning(self, "Ошибка", "Логин и пароль обязательны")
+
+    def edit_account_dialog(self):
+        selected = self.accounts_list.currentItem()
+        if not selected:
+            QMessageBox.warning(self, "Ошибка", "Выберите аккаунт")
+            return
+        login = selected.text()
+        account = self.account_manager.get_account(login)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Редактирование {login}")
+        layout = QFormLayout(dialog)
+
+        login_edit = QLineEdit(login)
+        login_edit.setReadOnly(True)
+        password_edit = QLineEdit()
+        password_edit.setEchoMode(QLineEdit.Password)
+        password_edit.setText(account['password'])
+
+        layout.addRow("Логин:", login_edit)
+        layout.addRow("Пароль:", password_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+
+        if dialog.exec_() == QDialog.Accepted:
+            new_password = password_edit.text()
+            if new_password:
+                self.account_manager.add_account(login, new_password, account.get('shared_secret', ''))
+                self.log_message(f"✅ Аккаунт {login} обновлён")
+
+    def remove_account(self):
+        selected = self.accounts_list.currentItem()
+        if not selected:
+            QMessageBox.warning(self, "Ошибка", "Выберите аккаунт")
+            return
+        login = selected.text()
+        reply = QMessageBox.question(self, "Подтверждение", f"Удалить аккаунт {login}?",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.account_manager.remove_account(login)
+            self.refresh_accounts_list()
+            self.secret_edit.clear()
+            self.log_message(f"✅ Аккаунт {login} удалён")
+
+    def save_shared_secret(self):
+        selected = self.accounts_list.currentItem()
+        if not selected:
+            QMessageBox.warning(self, "Ошибка", "Выберите аккаунт")
+            return
+        login = selected.text()
+        secret = self.secret_edit.text().strip()
+        if secret:
+            account = self.account_manager.get_account(login)
+            self.account_manager.add_account(login, account['password'], secret)
+            self.log_message(f"✅ Секрет сохранён для {login}")
+        else:
+            QMessageBox.warning(self, "Ошибка", "Введите секрет")
+
+    def link_steam_authenticator(self):
+        """Привязывает новый аутентификатор к выбранному аккаунту через steampy."""
+        selected = self.accounts_list.currentItem()
+        if not selected:
+            QMessageBox.warning(self, "Ошибка", "Выберите аккаунт для привязки")
+            return
+
+        login = selected.text()
+        account = self.account_manager.get_account(login)
+        password = account['password']
+
+        # Предупреждение о том, что привязка может потребовать SMS и изменить настройки аккаунта
+        reply = QMessageBox.question(
+            self,
+            "Подтверждение",
+            "Привязка аутентификатора изменит настройки безопасности аккаунта.\n"
+            "На ваш телефон придёт SMS-код. Продолжить?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.log_message(f"🔄 Начинаем привязку аутентификатора для {login}...")
+
+        class LinkThread(QThread):
+            finished = pyqtSignal(str, object)  # (login, secrets_dict)
+            error = pyqtSignal(str)
+            sms_needed = pyqtSignal()           # сигнал для запроса SMS-кода
+            email_needed = pyqtSignal(str)      # если потребуется email-код
+
+    def run(self):
+        try:
+            from steampy.client import SteamClient
+            from steampy.exceptions import CaptchaRequired, ApiException
+
+            client = SteamClient()
+            # Пытаемся залогиниться (без 2FA)
+            client.login(login, password)
+
+            # Запрашиваем добавление аутентификатора
+            # Метод add_authenticator возвращает dict с полем 'shared_secret' и другими данными
+            auth_data = client.add_authenticator()
+            # Сохраняем промежуточные данные (они могут понадобиться для финализации)
+            self.temp_auth_data = auth_data
+
+            # Если требуется SMS, шлём сигнал и ждём ввода
+            if auth_data.get('status') == 'awaiting_finalization':
+                self.sms_needed.emit()
+                # Здесь код будет ждать вызова метода finalize с SMS-кодом
+                # Мы организуем это через события, но для простоты сделаем через цикл ожидания
+                # В реальном коде лучше использовать QEventLoop, но для краткости оставим так
+                # Фактически мы будем ждать, пока пользователь введёт код через диалог.
+                # Поскольку мы в отдельном потоке, надо подождать.
+                # Используем метод, который будет вызван из основного потока после ввода SMS.
+            else:
+                # Возможно, сразу готово? Маловероятно.
+                self.finished.emit(login, auth_data)
+
+        except CaptchaRequired:
+            self.error.emit("Требуется капча (пока не поддерживается). Попробуйте позже.")
+        except ApiException as e:
+            self.error.emit(f"Ошибка API Steam: {e}")
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def finalize_with_sms(self, sms_code):
+        """Вызывается из основного потока после ввода SMS-кода."""
+        try:
+            from steampy.client import SteamClient  # уже импортировано
+            # Используем сохранённые данные
+            result = self.temp_auth_data['client'].finalize_authenticator(sms_code)
+            if result.get('status') == 'ok':
+                # Возвращаем финальные данные
+                self.finished.emit(self.temp_auth_data.get('login'), result)
+            else:
+                self.error.emit("Ошибка финализации аутентификатора.")
+        except Exception as e:
+            self.error.emit(str(e))
+
+        self.link_thread = LinkThread()
+        self.link_thread.sms_needed.connect(self.on_sms_needed)
+        self.link_thread.finished.connect(self.on_link_complete)
+        self.link_thread.error.connect(lambda msg: self.log_message(f"❌ Ошибка привязки: {msg}"))
+        self.link_thread.start()
+
+    def on_sms_needed(self):
+        """Вызывается, когда требуется ввод SMS-кода."""
+        # Запрашиваем код через диалог
+        sms_code, ok = QInputDialog.getText(
+            self,
+            "Код из SMS",
+            "Введите код, полученный в SMS от Steam:"
+        )
+        if ok and sms_code.strip():
+            # Передаём код в поток
+            self.link_thread.finalize_with_sms(sms_code.strip())
+        else:
+            self.link_thread.error.emit("SMS-код не введён")
+
+    def on_link_complete(self, login, auth_data):
+        """Обрабатывает успешную привязку и сохраняет секрет."""
+        # Извлекаем shared_secret
+        shared_secret = auth_data.get('shared_secret')
+        if not shared_secret:
+            self.log_message("❌ Не удалось получить shared_secret из ответа Steam.")
+            return
+
+        # Сохраняем секрет в AccountManager
+        account = self.account_manager.get_account(login)
+        self.account_manager.add_account(login, account['password'], shared_secret)
+
+        # Обновляем отображение
+        self.secret_edit.setText(shared_secret)
+        self.log_message(f"✅ Аутентификатор успешно привязан для {login}. Секрет сохранён.")
 
     def create_scan_tab(self):
         widget = QWidget()
@@ -874,37 +1135,38 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "Ошибка", "Логин и пароль обязательны")
 
-        def edit_account_dialog(self):
-            selected = self.accounts_list.currentItem()
-            if not selected:
-                QMessageBox.warning(self, "Ошибка", "Выберите аккаунт")
-                return
-            login = selected.text()
-            account = self.account_manager.get_account(login)
+    def edit_account_dialog(self):
+        """Диалог редактирования аккаунта."""
+        selected = self.accounts_list.currentItem()
+        if not selected:
+            QMessageBox.warning(self, "Ошибка", "Выберите аккаунт")
+            return
+        login = selected.text()
+        account = self.account_manager.get_account(login)
 
-            dialog = QDialog(self)
-            dialog.setWindowTitle(f"Редактирование {login}")
-            layout = QFormLayout(dialog)
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Редактирование {login}")
+        layout = QFormLayout(dialog)
 
-            login_edit = QLineEdit(login)
-            login_edit.setReadOnly(True)
-            password_edit = QLineEdit()
-            password_edit.setEchoMode(QLineEdit.Password)
-            password_edit.setText(account['password'])
+        login_edit = QLineEdit(login)
+        login_edit.setReadOnly(True)
+        password_edit = QLineEdit()
+        password_edit.setEchoMode(QLineEdit.Password)
+        password_edit.setText(account['password'])
 
-            layout.addRow("Логин:", login_edit)
-            layout.addRow("Пароль:", password_edit)
+        layout.addRow("Логин:", login_edit)
+        layout.addRow("Пароль:", password_edit)
 
-            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-            buttons.accepted.connect(dialog.accept)
-            buttons.rejected.connect(dialog.reject)
-            layout.addRow(buttons)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
 
-            if dialog.exec_() == QDialog.Accepted:
-                new_password = password_edit.text()
-                if new_password:
-                    self.account_manager.add_account(login, new_password, account.get('shared_secret', ''))
-                    self.log_message(f"✅ Аккаунт {login} обновлён")
+        if dialog.exec_() == QDialog.Accepted:
+            new_password = password_edit.text()
+            if new_password:
+                self.account_manager.add_account(login, new_password, account.get('shared_secret', ''))
+                self.log_message(f"✅ Аккаунт {login} обновлён")
 
     def remove_account(self):
         selected = self.accounts_list.currentItem()
